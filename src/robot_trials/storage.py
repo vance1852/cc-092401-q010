@@ -8,7 +8,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA_SQL = """
 PRAGMA foreign_keys = ON;
@@ -112,8 +112,11 @@ CREATE TABLE IF NOT EXISTS analysis_jobs (
     job_id INTEGER PRIMARY KEY AUTOINCREMENT,
     batch_id TEXT NOT NULL REFERENCES batches(batch_id),
     batch_revision INTEGER NOT NULL,
-    state TEXT NOT NULL CHECK (state IN ('queued', 'leased', 'succeeded', 'failed')),
+    state TEXT NOT NULL CHECK (state IN ('queued', 'leased', 'succeeded', 'dead', 'cancelled')),
     attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+    max_attempts INTEGER NOT NULL CHECK (max_attempts > 0),
+    fencing_token INTEGER NOT NULL DEFAULT 0 CHECK (fencing_token >= 0),
+    renewals INTEGER NOT NULL DEFAULT 0 CHECK (renewals >= 0),
     available_at TEXT NOT NULL,
     lease_owner TEXT,
     lease_expires_at TEXT,
@@ -122,6 +125,19 @@ CREATE TABLE IF NOT EXISTS analysis_jobs (
     updated_at TEXT NOT NULL,
     UNIQUE (batch_id, batch_revision)
 );
+
+CREATE TABLE IF NOT EXISTS analysis_job_failures (
+    failure_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id INTEGER NOT NULL REFERENCES analysis_jobs(job_id),
+    attempt INTEGER NOT NULL CHECK (attempt > 0),
+    worker_id TEXT,
+    kind TEXT NOT NULL CHECK (kind IN ('worker_failed', 'lease_expired')),
+    error TEXT NOT NULL,
+    recorded_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_analysis_job_failures_job
+ON analysis_job_failures(job_id, failure_id);
 
 CREATE TABLE IF NOT EXISTS analyses (
     analysis_id INTEGER PRIMARY KEY AUTOINCREMENT,

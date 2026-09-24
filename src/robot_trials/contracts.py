@@ -115,6 +115,7 @@ class Protocol:
     seed: int
     bootstrap_samples: int
     admission_rules: tuple[Mapping[str, Any], ...]
+    max_analysis_attempts: int | None
 
     @classmethod
     def from_dict(cls, raw: object) -> "Protocol":
@@ -176,6 +177,13 @@ class Protocol:
             if operator not in {"gte", "lte"}:
                 raise ValidationError(f"protocol.admission_rules[{index}].operator 不受支持")
             _decimal(rule.get("threshold"), f"protocol.admission_rules[{index}].threshold")
+        max_analysis_attempts = data.get("max_analysis_attempts")
+        if max_analysis_attempts is not None and (
+            isinstance(max_analysis_attempts, bool)
+            or not isinstance(max_analysis_attempts, int)
+            or not 1 <= max_analysis_attempts <= 100
+        ):
+            raise ValidationError("protocol.max_analysis_attempts 必须是 1 到 100 的整数")
         return cls(
             protocol_id=_required_text(data.get("protocol_id"), "protocol.protocol_id"),
             version=version,
@@ -187,6 +195,7 @@ class Protocol:
             seed=seed,
             bootstrap_samples=bootstrap_samples,
             admission_rules=rules,
+            max_analysis_attempts=max_analysis_attempts,
         )
 
     @property

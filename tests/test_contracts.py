@@ -27,6 +27,17 @@ class ContractTests(unittest.TestCase):
         with self.assertRaisesRegex(ValidationError, "不能重复"):
             Protocol.from_dict(raw)
 
+    def test_protocol_max_analysis_attempts_is_optional_and_bounded(self) -> None:
+        self.assertIsNone(self.protocol.max_analysis_attempts)
+        raw = deepcopy(self.raw_protocol)
+        raw["max_analysis_attempts"] = 5
+        self.assertEqual(Protocol.from_dict(raw).max_analysis_attempts, 5)
+        for invalid in (0, -1, 101, "3", True):
+            raw = deepcopy(self.raw_protocol)
+            raw["max_analysis_attempts"] = invalid
+            with self.assertRaisesRegex(ValidationError, "max_analysis_attempts"):
+                Protocol.from_dict(raw)
+
     def test_observation_rejects_unknown_stratum(self) -> None:
         raw = {
             "source_batch": "batch",
