@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import secrets
 import sqlite3
 from datetime import timedelta
 from decimal import Decimal
@@ -21,10 +22,15 @@ ROLE_PERMISSIONS = {
         "catalog.write", "batch.create", "batch.start", "observation.import",
         "exclusion.request", "exclusion.revoke",
     },
-    "statistician": {"protocol.publish", "batch.seal", "exclusion.review", "analysis.run"},
+    "statistician": {
+        "protocol.publish", "batch.seal", "exclusion.review", "analysis.run",
+        "analysis.deadletter.read", "analysis.deadletter.requeue", "analysis.deadletter.cancel",
+    },
     "approver": {"decision.write"},
-    "auditor": {"report.read", "audit.read"},
+    "auditor": {"report.read", "audit.read", "analysis.deadletter.read"},
 }
+
+DEFAULT_MAX_ATTEMPTS = 3
 
 
 class TrialService:
@@ -338,6 +344,8 @@ class TrialService:
 
     def seal_batch(self, actor_id: str, batch_id: str, expected_revision: int) -> dict[str, Any]:
         self._require(actor_id, "batch.seal")
+        current = self.get_batch(batch_id)
+        protocol, _ = self._protocol(current["protocol_id"], current["protocol_version"])
         with transaction(self.connection, immediate=True):
             pending = self.connection.execute(
                 "SELECT count(*) FROM exclusion_requests e JOIN observations o ON o.observation_id=e.observation_id "
@@ -355,9 +363,9 @@ class TrialService:
             new_revision = expected_revision + 1
             now = self._now()
             self.connection.execute(
-                "INSERT INTO analysis_jobs(batch_id,batch_revision,state,available_at,created_at,updated_at) "
-                "VALUES(?,?, 'queued', ?,?,?)",
-                (batch_id, new_revision, now, now, now),
+                "INSERT INTO analysis_jobs(batch_id,batch_revision,state,available_at,max_attempts,"
+                "created_at,updated_at) VALUES(?,?, 'queued', ?,?,?,?)",
+                (batch_id, new_revision, now, protocol.max_analysis_attempts, now, now),
             )
             self._audit("batch", batch_id, "batch.sealed", actor_id, {"revision": new_revision})
         return self.get_batch(batch_id)
@@ -365,24 +373,87 @@ class TrialService:
     def claim_job(self, worker_id: str, lease_seconds: int = 60) -> dict[str, Any] | None:
         if lease_seconds <= 0:
             raise ValidationFailed("租约时长必须大于零")
-        now = self._now()
-        expires = isoformat(self.clock.now() + timedelta(seconds=lease_seconds))
+        now_value = self.clock.now()
+        now = isoformat(now_value)
         with transaction(self.connection, immediate=True):
-            row = self.connection.execute(
-                "SELECT job_id FROM analysis_jobs WHERE "
-                "(state='queued' AND available_at<=?) OR (state='leased' AND lease_expires_at<=?) "
-                "ORDER BY available_at,job_id LIMIT 1",
-                (now, now),
-            ).fetchone()
-            if row is None:
-                return None
-            self.connection.execute(
-                "UPDATE analysis_jobs SET state='leased',attempts=attempts+1,lease_owner=?,lease_expires_at=?,updated_at=? "
-                "WHERE job_id=?",
-                (worker_id, expires, now, row["job_id"]),
+            while True:
+                row = self.connection.execute(
+                    "SELECT * FROM analysis_jobs WHERE "
+                    "(state='queued' AND available_at<=?) OR (state='leased' AND lease_expires_at<=?) "
+                    "ORDER BY available_at,job_id LIMIT 1",
+                    (now, now),
+                ).fetchone()
+                if row is None:
+                    return None
+                if row["state"] == "leased":
+                    # 未显式报告失败就过期的尝试同样留下失败摘要，避免静默丢失。
+                    history = json.loads(row["attempts_json"])
+                    history.append({
+                        "attempt": row["attempts"],
+                        "worker": row["lease_owner"],
+                        "outcome": "lease_expired",
+                        "failed_at": now,
+                        "error": "租约过期，任务被其他工作进程接管",
+                    })
+                    if row["attempts"] >= row["max_attempts"]:
+                        # 最后一次机会也以过期告终：直接进入死信，继续寻找下一个可领取任务。
+                        self.connection.execute(
+                            "UPDATE analysis_jobs SET state='dead_letter',lease_owner=NULL,lease_token=NULL,"
+                            "lease_expires_at=NULL,attempts_json=?,dead_letter_at=?,dead_letter_reason=?,"
+                            "updated_at=? WHERE job_id=?",
+                            (canonical_json(history), now,
+                             f"连续 {row['attempts']} 次尝试均失败，达到上限 {row['max_attempts']}",
+                             now, row["job_id"]),
+                        )
+                        self._audit(
+                            "job", str(row["job_id"]), "job.dead_lettered", "system",
+                            {"batch_id": row["batch_id"], "attempts": row["attempts"],
+                             "max_attempts": row["max_attempts"], "last_error": "租约过期"},
+                        )
+                        continue
+                else:
+                    history = json.loads(row["attempts_json"])
+                reclaimed = row["state"] == "leased"
+                token = secrets.token_hex(16)
+                expires = isoformat(now_value + timedelta(seconds=lease_seconds))
+                self.connection.execute(
+                    "UPDATE analysis_jobs SET state='leased',attempts=attempts+1,lease_owner=?,lease_token=?,"
+                    "lease_expires_at=?,attempts_json=?,updated_at=? WHERE job_id=?",
+                    (worker_id, token, expires, canonical_json(history), now, row["job_id"]),
+                )
+                claimed = self.connection.execute(
+                    "SELECT * FROM analysis_jobs WHERE job_id=?", (row["job_id"],)
+                ).fetchone()
+                self._audit(
+                    "job", str(row["job_id"]), "job.reclaimed" if reclaimed else "job.claimed",
+                    worker_id,
+                    {"batch_id": row["batch_id"], "attempt": claimed["attempts"], "lease_token": token},
+                )
+                return dict(claimed)
+
+    def heartbeat_job(
+        self, worker_id: str, job_id: int, lease_token: str, lease_seconds: int = 60
+    ) -> dict[str, Any]:
+        """工作进程在 fencing 凭证仍有效时延长租约；延长不会缩短既有期限。"""
+
+        if lease_seconds <= 0:
+            raise ValidationFailed("租约时长必须大于零")
+        now_value = self.clock.now()
+        now = isoformat(now_value)
+        expires = isoformat(now_value + timedelta(seconds=lease_seconds))
+        with transaction(self.connection, immediate=True):
+            cursor = self.connection.execute(
+                "UPDATE analysis_jobs SET lease_expires_at=MAX(lease_expires_at,?),updated_at=? "
+                "WHERE job_id=? AND state='leased' AND lease_owner=? AND lease_token=? "
+                "AND lease_expires_at>?",
+                (expires, now, job_id, worker_id, lease_token, now),
             )
-            claimed = self.connection.execute("SELECT * FROM analysis_jobs WHERE job_id=?", (row["job_id"],)).fetchone()
-        return dict(claimed)
+            if cursor.rowcount != 1:
+                raise InvalidState("凭证无效、任务已被接管或租约已过期，续约被拒绝")
+            row = self.connection.execute(
+                "SELECT * FROM analysis_jobs WHERE job_id=?", (job_id,)
+            ).fetchone()
+        return dict(row)
 
     def _analysis_observations(self, batch_id: str, protocol: Protocol) -> tuple[Observation, ...]:
         rows = self.connection.execute(
@@ -407,13 +478,19 @@ class TrialService:
             ))
         return tuple(items)
 
-    def complete_job(self, worker_id: str, job_id: int, statistician_id: str) -> dict[str, Any]:
+    def complete_job(
+        self, worker_id: str, job_id: int, statistician_id: str, lease_token: str
+    ) -> dict[str, Any]:
         self._require(statistician_id, "analysis.run")
         job = self.connection.execute("SELECT * FROM analysis_jobs WHERE job_id=?", (job_id,)).fetchone()
         if job is None:
             raise NotFound("分析任务不存在")
-        if job["state"] != "leased" or job["lease_owner"] != worker_id:
-            raise InvalidState("任务未由当前工作进程持有")
+        if (
+            job["state"] != "leased"
+            or job["lease_owner"] != worker_id
+            or job["lease_token"] != lease_token
+        ):
+            raise InvalidState("任务未由当前工作进程以有效凭证持有")
         if job["lease_expires_at"] <= self._now():
             raise InvalidState("任务租约已经过期")
         batch = self.get_batch(job["batch_id"])
@@ -438,7 +515,7 @@ class TrialService:
             ).fetchone()
             if existing is None:
                 cursor = self.connection.execute(
-                    "INSERT INTO analyses(batch_id,batch_revision,protocol_sha256,input_sha256,algorithm_version,seed," 
+                    "INSERT INTO analyses(batch_id,batch_revision,protocol_sha256,input_sha256,algorithm_version,seed,"
                     "result_json,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
                     (
                         batch["batch_id"], job["batch_revision"], protocol_digest, input_digest,
@@ -449,11 +526,23 @@ class TrialService:
             else:
                 analysis_id = existing["analysis_id"]
                 result = json.loads(existing["result_json"])
-            self.connection.execute(
-                "UPDATE analysis_jobs SET state='succeeded',lease_owner=NULL,lease_expires_at=NULL,updated_at=? "
-                "WHERE job_id=? AND state='leased' AND lease_owner=?",
-                (self._now(), job_id, worker_id),
+            now = self._now()
+            history = json.loads(job["attempts_json"])
+            history.append({
+                "attempt": job["attempts"],
+                "worker": worker_id,
+                "outcome": "succeeded",
+                "finished_at": now,
+            })
+            # 权威判定：状态、持有者、fencing 凭证与有效期必须同时成立。
+            cursor = self.connection.execute(
+                "UPDATE analysis_jobs SET state='succeeded',lease_owner=NULL,lease_token=NULL,lease_expires_at=NULL,"
+                "last_error=NULL,attempts_json=?,updated_at=? "
+                "WHERE job_id=? AND state='leased' AND lease_owner=? AND lease_token=? AND lease_expires_at>?",
+                (canonical_json(history), now, job_id, worker_id, lease_token, now),
             )
+            if cursor.rowcount != 1:
+                raise InvalidState("任务在分析期间已被接管或进入死信，结果不予接受")
             self.connection.execute(
                 "UPDATE batches SET state='analyzed' WHERE batch_id=? AND state IN ('sealed','analyzing')",
                 (batch["batch_id"],),
@@ -467,17 +556,153 @@ class TrialService:
             )
         return {"analysis_id": analysis_id, "input_sha256": input_digest, "result": result}
 
-    def fail_job(self, worker_id: str, job_id: int, error: str, retry_seconds: int = 0) -> dict[str, Any]:
-        available = isoformat(self.clock.now() + timedelta(seconds=retry_seconds))
+    def fail_job(self, worker_id: str, job_id: int, error: str, *, lease_token: str,
+                 retry_seconds: int = 0) -> dict[str, Any]:
+        if retry_seconds < 0:
+            raise ValidationFailed("重试延迟不能为负")
+        if not isinstance(lease_token, str) or not lease_token:
+            raise ValidationFailed("fail_job 必须提供领取时获得的 fencing 凭证")
+        message = error[:1000]
+        now_value = self.clock.now()
+        now = isoformat(now_value)
+        available = isoformat(now_value + timedelta(seconds=retry_seconds))
         with transaction(self.connection, immediate=True):
-            cursor = self.connection.execute(
-                "UPDATE analysis_jobs SET state='queued',available_at=?,lease_owner=NULL,lease_expires_at=NULL," 
-                "last_error=?,updated_at=? WHERE job_id=? AND state='leased' AND lease_owner=?",
-                (available, error[:1000], self._now(), job_id, worker_id),
+            row = self.connection.execute(
+                "SELECT * FROM analysis_jobs WHERE job_id=?", (job_id,)
+            ).fetchone()
+            if (
+                row is None
+                or row["state"] != "leased"
+                or row["lease_owner"] != worker_id
+                or row["lease_token"] != lease_token
+            ):
+                raise InvalidState("任务未由当前工作进程持有或凭证不匹配")
+            if row["lease_expires_at"] <= now:
+                raise InvalidState("任务租约已经过期")
+            history = json.loads(row["attempts_json"])
+            history.append({
+                "attempt": row["attempts"],
+                "worker": worker_id,
+                "outcome": "failed",
+                "failed_at": now,
+                "retry_after_seconds": retry_seconds,
+                "error": message,
+            })
+            history_json = canonical_json(history)
+            if row["attempts"] >= row["max_attempts"]:
+                # 已用尽协议或系统配置的尝试上限：转入死信，保留每次失败摘要。
+                self.connection.execute(
+                    "UPDATE analysis_jobs SET state='dead_letter',lease_owner=NULL,lease_token=NULL,"
+                    "lease_expires_at=NULL,last_error=?,attempts_json=?,"
+                    "dead_letter_at=?,dead_letter_reason=?,updated_at=? WHERE job_id=?",
+                    (message, history_json, now,
+                     f"连续 {row['attempts']} 次尝试均失败，达到上限 {row['max_attempts']}", now, job_id),
+                )
+                self._audit(
+                    "job", str(job_id), "job.dead_lettered", worker_id,
+                    {"batch_id": row["batch_id"], "attempts": row["attempts"],
+                     "max_attempts": row["max_attempts"], "last_error": message},
+                )
+                return {"job_id": job_id, "state": "dead_letter", "available_at": None}
+            self.connection.execute(
+                "UPDATE analysis_jobs SET state='queued',available_at=?,lease_owner=NULL,lease_token=NULL,"
+                "lease_expires_at=NULL,last_error=?,attempts_json=?,updated_at=? WHERE job_id=?",
+                (available, message, history_json, now, job_id),
             )
-            if cursor.rowcount != 1:
-                raise InvalidState("任务未由当前工作进程持有")
         return {"job_id": job_id, "state": "queued", "available_at": available}
+
+    def get_job(self, actor_id: str, job_id: int) -> dict[str, Any]:
+        self._require(actor_id, "analysis.deadletter.read")
+        row = self.connection.execute("SELECT * FROM analysis_jobs WHERE job_id=?", (job_id,)).fetchone()
+        if row is None:
+            raise NotFound("分析任务不存在")
+        result = dict(row)
+        result["attempt_history"] = json.loads(row["attempts_json"])
+        return result
+
+    def list_dead_letter_jobs(self, actor_id: str) -> list[dict[str, Any]]:
+        """值班视角：列出死信与已取消任务，附全部尝试摘要。"""
+
+        self._require(actor_id, "analysis.deadletter.read")
+        rows = self.connection.execute(
+            "SELECT * FROM analysis_jobs WHERE state IN ('dead_letter','cancelled') "
+            "ORDER BY COALESCE(dead_letter_at,cancelled_at),job_id"
+        ).fetchall()
+        return [dict(row) | {"attempt_history": json.loads(row["attempts_json"])} for row in rows]
+
+    def requeue_dead_job(
+        self, actor_id: str, job_id: int, reason: str, max_attempts: int | None = None
+    ) -> dict[str, Any]:
+        """授权统计负责人带理由把死信任务重新入队；已取消任务不能由此复活。"""
+
+        self._require(actor_id, "analysis.deadletter.requeue")
+        if not reason.strip():
+            raise ValidationFailed("重新入队必须填写理由")
+        if max_attempts is not None and max_attempts <= 0:
+            raise ValidationFailed("最大尝试次数必须大于零")
+        now = self._now()
+        with transaction(self.connection, immediate=True):
+            row = self.connection.execute(
+                "SELECT * FROM analysis_jobs WHERE job_id=?", (job_id,)
+            ).fetchone()
+            if row is None:
+                raise NotFound("分析任务不存在")
+            if row["state"] == "cancelled":
+                raise InvalidState("已永久取消的任务不能重新入队")
+            if row["state"] != "dead_letter":
+                raise InvalidState("只有死信任务可以人工重新入队")
+            new_max = max_attempts or row["max_attempts"]
+            history = json.loads(row["attempts_json"])
+            history.append({
+                "attempt": None,
+                "worker": None,
+                "outcome": "manually_requeued",
+                "at": now,
+                "actor": actor_id,
+                "reason": reason,
+                "new_max_attempts": new_max,
+            })
+            self.connection.execute(
+                "UPDATE analysis_jobs SET state='queued',available_at=?,attempts=0,lease_owner=NULL,"
+                "lease_token=NULL,lease_expires_at=NULL,max_attempts=?,requeued_count=requeued_count+1,"
+                "dead_letter_at=NULL,dead_letter_reason=NULL,dead_letter_actor=NULL,"
+                "attempts_json=?,updated_at=? WHERE job_id=? AND state='dead_letter'",
+                (now, new_max, canonical_json(history), now, job_id),
+            )
+            self._audit(
+                "job", str(job_id), "job.requeued", actor_id,
+                {"batch_id": row["batch_id"], "reason": reason, "max_attempts": new_max},
+            )
+        return {"job_id": job_id, "state": "queued", "available_at": now, "max_attempts": new_max}
+
+    def cancel_dead_job(self, actor_id: str, job_id: int, reason: str) -> dict[str, Any]:
+        """授权统计负责人带理由永久取消死信任务。"""
+
+        self._require(actor_id, "analysis.deadletter.cancel")
+        if not reason.strip():
+            raise ValidationFailed("取消必须填写理由")
+        now = self._now()
+        with transaction(self.connection, immediate=True):
+            row = self.connection.execute(
+                "SELECT * FROM analysis_jobs WHERE job_id=?", (job_id,)
+            ).fetchone()
+            if row is None:
+                raise NotFound("分析任务不存在")
+            if row["state"] == "cancelled":
+                raise InvalidState("任务已经取消")
+            if row["state"] != "dead_letter":
+                raise InvalidState("只有死信任务可以永久取消")
+            self.connection.execute(
+                "UPDATE analysis_jobs SET state='cancelled',cancelled_at=?,cancel_reason=?,cancel_actor=?,"
+                "lease_owner=NULL,lease_token=NULL,lease_expires_at=NULL,updated_at=? "
+                "WHERE job_id=? AND state='dead_letter'",
+                (now, reason[:1000], actor_id, now, job_id),
+            )
+            self._audit(
+                "job", str(job_id), "job.cancelled", actor_id,
+                {"batch_id": row["batch_id"], "reason": reason},
+            )
+        return {"job_id": job_id, "state": "cancelled", "cancelled_at": now}
 
     def decide(
         self, actor_id: str, batch_id: str, analysis_id: int, decision: str, reason: str
@@ -538,8 +763,28 @@ class TrialService:
             "WHERE entity_type='batch' AND entity_id=? "
             "ORDER BY event_id", (batch_id,)
         ).fetchall()
+        job_row = self.connection.execute(
+            "SELECT * FROM analysis_jobs WHERE batch_id=? ORDER BY job_id DESC LIMIT 1", (batch_id,)
+        ).fetchone()
+        job = None if job_row is None else {
+            "job_id": job_row["job_id"],
+            "state": job_row["state"],
+            "attempts": job_row["attempts"],
+            "max_attempts": job_row["max_attempts"],
+            "lease_owner": job_row["lease_owner"],
+            "lease_expires_at": job_row["lease_expires_at"],
+            "available_at": job_row["available_at"],
+            "last_error": job_row["last_error"],
+            "dead_letter_at": job_row["dead_letter_at"],
+            "dead_letter_reason": job_row["dead_letter_reason"],
+            "cancelled_at": job_row["cancelled_at"],
+            "cancel_reason": job_row["cancel_reason"],
+            "requeued_count": job_row["requeued_count"],
+            "attempt_history": json.loads(job_row["attempts_json"]),
+        }
         return {
             "batch": batch,
+            "job": job,
             "protocol": {
                 "protocol_id": protocol.protocol_id,
                 "version": protocol.version,

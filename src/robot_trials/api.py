@@ -117,14 +117,38 @@ class JsonApplication:
             if method == "POST" and path == "/jobs/claim":
                 result = self.service.claim_job(payload["worker_id"], int(payload.get("lease_seconds", 60)))
                 return Response(200, {"job": result})
+            if method == "POST" and len(parts) == 3 and parts[0] == "jobs" and parts[2] == "heartbeat":
+                result = self.service.heartbeat_job(
+                    payload["worker_id"], int(parts[1]), payload["lease_token"],
+                    int(payload.get("lease_seconds", 60)),
+                )
+                return Response(200, result)
             if method == "POST" and len(parts) == 3 and parts[0] == "jobs" and parts[2] == "complete":
                 result = self.service.complete_job(
-                    payload["worker_id"], int(parts[1]), self._actor(normalized_headers)
+                    payload["worker_id"], int(parts[1]), self._actor(normalized_headers),
+                    payload["lease_token"],
                 )
                 return Response(200, result)
             if method == "POST" and len(parts) == 3 and parts[0] == "jobs" and parts[2] == "fail":
                 result = self.service.fail_job(
-                    payload["worker_id"], int(parts[1]), payload["error"], int(payload.get("retry_seconds", 0))
+                    payload["worker_id"], int(parts[1]), payload["error"],
+                    lease_token=payload["lease_token"],
+                    retry_seconds=int(payload.get("retry_seconds", 0)),
+                )
+                return Response(200, result)
+            if method == "GET" and path == "/dead-letter":
+                return Response(200, {"jobs": self.service.list_dead_letter_jobs(self._actor(normalized_headers))})
+            if method == "GET" and len(parts) == 2 and parts[0] == "jobs":
+                return Response(200, self.service.get_job(self._actor(normalized_headers), int(parts[1])))
+            if method == "POST" and len(parts) == 3 and parts[0] == "jobs" and parts[2] == "requeue":
+                result = self.service.requeue_dead_job(
+                    self._actor(normalized_headers), int(parts[1]), payload["reason"],
+                    int(payload["max_attempts"]) if payload.get("max_attempts") is not None else None,
+                )
+                return Response(200, result)
+            if method == "POST" and len(parts) == 3 and parts[0] == "jobs" and parts[2] == "cancel":
+                result = self.service.cancel_dead_job(
+                    self._actor(normalized_headers), int(parts[1]), payload["reason"]
                 )
                 return Response(200, result)
             if method == "POST" and path == "/decisions":

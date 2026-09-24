@@ -114,6 +114,7 @@ class Protocol:
     stratum_weights: Mapping[str, Decimal]
     seed: int
     bootstrap_samples: int
+    max_analysis_attempts: int
     admission_rules: tuple[Mapping[str, Any], ...]
 
     @classmethod
@@ -160,6 +161,14 @@ class Protocol:
             or bootstrap_samples > 100000
         ):
             raise ValidationError("protocol.bootstrap_samples 必须在 100 到 100000 之间")
+        max_analysis_attempts = data.get("max_analysis_attempts", 3)
+        if (
+            isinstance(max_analysis_attempts, bool)
+            or not isinstance(max_analysis_attempts, int)
+            or max_analysis_attempts < 1
+            or max_analysis_attempts > 20
+        ):
+            raise ValidationError("protocol.max_analysis_attempts 必须在 1 到 20 之间")
         rules = tuple(
             _require_mapping(item, f"protocol.admission_rules[{index}]")
             for index, item in enumerate(
@@ -186,6 +195,7 @@ class Protocol:
             stratum_weights=weights,
             seed=seed,
             bootstrap_samples=bootstrap_samples,
+            max_analysis_attempts=max_analysis_attempts,
             admission_rules=rules,
         )
 

@@ -8,7 +8,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA_SQL = """
 PRAGMA foreign_keys = ON;
@@ -112,12 +112,24 @@ CREATE TABLE IF NOT EXISTS analysis_jobs (
     job_id INTEGER PRIMARY KEY AUTOINCREMENT,
     batch_id TEXT NOT NULL REFERENCES batches(batch_id),
     batch_revision INTEGER NOT NULL,
-    state TEXT NOT NULL CHECK (state IN ('queued', 'leased', 'succeeded', 'failed')),
+    state TEXT NOT NULL CHECK (state IN (
+        'queued', 'leased', 'succeeded', 'dead_letter', 'cancelled'
+    )),
     attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+    max_attempts INTEGER NOT NULL DEFAULT 3 CHECK (max_attempts > 0),
     available_at TEXT NOT NULL,
     lease_owner TEXT,
+    lease_token TEXT,
     lease_expires_at TEXT,
     last_error TEXT,
+    dead_letter_at TEXT,
+    dead_letter_reason TEXT,
+    dead_letter_actor TEXT REFERENCES users(user_id),
+    cancelled_at TEXT,
+    cancel_reason TEXT,
+    cancel_actor TEXT REFERENCES users(user_id),
+    requeued_count INTEGER NOT NULL DEFAULT 0 CHECK (requeued_count >= 0),
+    attempts_json TEXT NOT NULL DEFAULT '[]',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     UNIQUE (batch_id, batch_revision)
@@ -190,11 +202,72 @@ def transaction(connection: sqlite3.Connection, *, immediate: bool = False) -> I
         connection.commit()
 
 
+JOB_TABLE_SQL = """
+CREATE TABLE analysis_jobs (
+    job_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id TEXT NOT NULL REFERENCES batches(batch_id),
+    batch_revision INTEGER NOT NULL,
+    state TEXT NOT NULL CHECK (state IN (
+        'queued', 'leased', 'succeeded', 'dead_letter', 'cancelled'
+    )),
+    attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+    max_attempts INTEGER NOT NULL DEFAULT 3 CHECK (max_attempts > 0),
+    available_at TEXT NOT NULL,
+    lease_owner TEXT,
+    lease_token TEXT,
+    lease_expires_at TEXT,
+    last_error TEXT,
+    dead_letter_at TEXT,
+    dead_letter_reason TEXT,
+    dead_letter_actor TEXT REFERENCES users(user_id),
+    cancelled_at TEXT,
+    cancel_reason TEXT,
+    cancel_actor TEXT REFERENCES users(user_id),
+    requeued_count INTEGER NOT NULL DEFAULT 0 CHECK (requeued_count >= 0),
+    attempts_json TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (batch_id, batch_revision)
+)
+"""
+
+
+def _table_columns(connection: sqlite3.Connection, table: str) -> frozenset[str]:
+    return frozenset(row["name"] for row in connection.execute(f"PRAGMA table_info({table})"))
+
+
+def _migrate_analysis_jobs(connection: sqlite3.Connection) -> None:
+    """把旧版 analysis_jobs（无 fencing 凭证与死信列）迁移到当前模式。"""
+
+    columns = _table_columns(connection, "analysis_jobs")
+    if not columns or "lease_token" in columns:
+        return
+    connection.execute("ALTER TABLE analysis_jobs RENAME TO analysis_jobs_v2")
+    connection.execute(JOB_TABLE_SQL)
+    # 旧实现中 state='failed' 只会瞬时出现；迁移时统一视为待重试排队。
+    connection.execute(
+        """
+        INSERT INTO analysis_jobs(
+            job_id,batch_id,batch_revision,state,attempts,max_attempts,available_at,
+            lease_owner,lease_token,lease_expires_at,last_error,
+            requeued_count,attempts_json,created_at,updated_at
+        )
+        SELECT job_id,batch_id,batch_revision,
+               CASE WHEN state='failed' THEN 'queued' ELSE state END,
+               attempts,3,available_at,lease_owner,NULL,lease_expires_at,last_error,
+               0,'[]',created_at,updated_at
+        FROM analysis_jobs_v2
+        """
+    )
+    connection.execute("DROP TABLE analysis_jobs_v2")
+
+
 def initialize(connection: sqlite3.Connection) -> None:
     """初始化基础资料表，重复执行不改变已有数据。"""
 
     connection.executescript(SCHEMA_SQL)
     with transaction(connection, immediate=True):
+        _migrate_analysis_jobs(connection)
         connection.execute(
             "INSERT INTO schema_meta(key, value) VALUES('schema_version', ?) "
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
